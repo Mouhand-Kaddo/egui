@@ -146,6 +146,7 @@ impl TextShape {
             *pos *= transform.scaling;
 
             let text::Row {
+                paragraph_level: _,
                 section_index_at_start: _,
                 glyphs: _, // TODO(emilk): would it make sense to transform these?
                 size,

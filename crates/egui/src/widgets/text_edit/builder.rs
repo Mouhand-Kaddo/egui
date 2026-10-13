@@ -1455,3 +1455,244 @@ fn check_for_mutating_key_press(
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod bidi_tests {
+    use super::*;
+    use crate::FontId;
+
+    fn run_ui(mut test: impl FnMut(&mut Ui)) {
+        let ctx = crate::Context::default();
+        if let Some(root) = std::env::var_os("CRAFT_FONTS_DIR") {
+            let path =
+                std::path::PathBuf::from(root).join("fonts/noto-sans-arabic/NotoSansArabic.ttf");
+            let mut definitions = crate::FontDefinitions::default();
+            definitions.font_data.insert(
+                "arabic".into(),
+                Arc::new(crate::FontData::from_owned(
+                    std::fs::read(path).expect("Noto Arabic"),
+                )),
+            );
+            definitions
+                .families
+                .get_mut(&crate::FontFamily::Proportional)
+                .unwrap()
+                .insert(0, "arabic".into());
+            ctx.set_fonts(definitions);
+        }
+        ctx.run_ui(Default::default(), |ui| test(ui))
+            .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn bidi_keyboard_selection_and_deletion_keep_logical_text() {
+        run_ui(|ui| {
+            let source = "اب 12";
+            let galley = ui.fonts_mut(|fonts| {
+                fonts.layout_no_wrap(source.into(), FontId::proportional(24.0), Color32::WHITE)
+            });
+            let mut range = CCursorRange::one(CCursor::new(0));
+            for expected in ["ا", "اب"] {
+                range.on_key_press(
+                    OperatingSystem::Windows,
+                    &galley,
+                    &Modifiers::SHIFT,
+                    Key::ArrowLeft,
+                );
+                assert_eq!(range.slice_str(source), expected);
+            }
+            let mut text = source.to_owned();
+            let result = check_for_mutating_key_press(
+                OperatingSystem::Windows,
+                &range,
+                &mut text,
+                &galley,
+                &Modifiers::NONE,
+                Key::Delete,
+            )
+            .unwrap();
+            assert_eq!(text, " 12");
+            assert_eq!(result.primary.index.0, 0);
+            let mut text = source.to_owned();
+            check_for_mutating_key_press(
+                OperatingSystem::Windows,
+                &CCursorRange::one(CCursor::new(1)),
+                &mut text,
+                &galley,
+                &Modifiers::NONE,
+                Key::Backspace,
+            );
+            assert_eq!(text, "ب 12");
+            let mut range = CCursorRange::two(CCursor::new(0), CCursor::new(2));
+            range.on_key_press(
+                OperatingSystem::Windows,
+                &galley,
+                &Modifiers::NONE,
+                Key::ArrowRight,
+            );
+            assert_eq!(range.primary.index.0, 0, "collapse to visual right edge");
+            range.on_key_press(
+                OperatingSystem::Windows,
+                &galley,
+                &Modifiers::CTRL,
+                Key::ArrowLeft,
+            );
+            assert_eq!(
+                range.primary.index.0, 2,
+                "move through the Arabic word visually left"
+            );
+            range.on_key_press(
+                OperatingSystem::Windows,
+                &galley,
+                &Modifiers::NONE,
+                Key::End,
+            );
+            assert_eq!(range.primary.index.0, 5);
+            let end = galley.pos_from_cursor(range.primary).center().x;
+            assert_eq!(end, galley.rows[0].glyphs[4].max_x());
+            range.on_key_press(
+                OperatingSystem::Windows,
+                &galley,
+                &Modifiers::CTRL,
+                Key::ArrowRight,
+            );
+            assert_eq!(
+                range.primary.index.0, 0,
+                "visual word movement crosses from digits to Arabic on the right"
+            );
+            range.on_key_press(
+                OperatingSystem::Windows,
+                &galley,
+                &Modifiers::CTRL,
+                Key::ArrowLeft,
+            );
+            range.on_key_press(
+                OperatingSystem::Windows,
+                &galley,
+                &Modifiers::CTRL,
+                Key::ArrowLeft,
+            );
+            assert_eq!(
+                range.primary.index.0, 3,
+                "visual left reaches the left edge of the number"
+            );
+        });
+    }
+
+    #[test]
+    fn bidi_selection_mesh_excludes_the_unselected_neighbor() {
+        run_ui(|ui| {
+            let mut galley = ui.fonts_mut(|fonts| {
+                fonts.layout_no_wrap(
+                    "ab اب cd".into(),
+                    FontId::proportional(24.0),
+                    Color32::WHITE,
+                )
+            });
+            let row = &galley.rows[0];
+            let before = row.visuals.mesh.vertices.len();
+            let neighbor = row.glyphs[4].logical_rect().center().x;
+            let original_neighbor_color =
+                row.visuals.mesh.vertices[row.glyphs[4].first_vertex as usize].color;
+            let mut triangles = Vec::new();
+            paint_text_selection(
+                &mut galley,
+                ui.visuals(),
+                &CCursorRange::two(CCursor::new(1), CCursor::new(4)),
+                Some(&mut triangles),
+            );
+            let row = &galley.rows[0];
+            assert_eq!(
+                triangles.len(),
+                2,
+                "the selected logical substring needs disjoint rectangles"
+            );
+            assert_eq!(
+                row.visuals.mesh.vertices[row.glyphs[4].first_vertex as usize].color,
+                original_neighbor_color
+            );
+            for corners in row.visuals.mesh.vertices[before..].chunks_exact(4) {
+                let min = corners
+                    .iter()
+                    .map(|v| v.pos.x)
+                    .fold(f32::INFINITY, f32::min);
+                let max = corners
+                    .iter()
+                    .map(|v| v.pos.x)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                assert!(neighbor < min || max < neighbor);
+            }
+        });
+    }
+
+    #[test]
+    fn bidi_seeded_edit_sequences_preserve_unselected_text() {
+        run_ui(|ui| {
+            let pieces = [
+                "مرحبا",
+                " 12 ",
+                "(ABC)",
+                " سَلَام ",
+                "אב",
+                "لا",
+                "\n",
+                "دَرْس",
+                " ١٢٣ ",
+                "xyz",
+            ];
+            for seed in 0..15u64 {
+                let mut state = seed + 1;
+                let mut text = String::new();
+                for _ in 0..6 {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    text.push_str(pieces[(state >> 32) as usize % pieces.len()]);
+                }
+                for step in 0..12 {
+                    let galley = ui.fonts_mut(|fonts| {
+                        fonts.layout(
+                            text.clone(),
+                            FontId::proportional(20.0),
+                            Color32::WHITE,
+                            95.0,
+                        )
+                    });
+                    let count = text.chars().count();
+                    if count == 0 {
+                        break;
+                    }
+                    let start = (state as usize) % (count + 1);
+                    let mut range = CCursorRange::one(CCursor::new(start));
+                    range.on_key_press(
+                        OperatingSystem::Windows,
+                        &galley,
+                        &Modifiers::SHIFT,
+                        if step % 2 == 0 {
+                            Key::ArrowLeft
+                        } else {
+                            Key::ArrowRight
+                        },
+                    );
+                    assert!(range.primary.index.0 <= count);
+                    let [min, max] = range.sorted_cursors();
+                    let expected: String = text
+                        .chars()
+                        .take(min.index.0)
+                        .chain(text.chars().skip(max.index.0))
+                        .collect();
+                    if !range.is_empty() {
+                        check_for_mutating_key_press(
+                            OperatingSystem::Windows,
+                            &range,
+                            &mut text,
+                            &galley,
+                            &Modifiers::NONE,
+                            Key::Delete,
+                        );
+                        assert_eq!(text, expected, "seed {seed}, step {step}");
+                    }
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                }
+            }
+        });
+    }
+}

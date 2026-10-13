@@ -15,6 +15,10 @@ pub struct CCursor {
     /// do we prefer the next row?
     /// This is *almost* always what you want, *except* for when
     /// explicitly clicking the end of a row or pressing the end key.
+    ///
+    /// At a bidirectional run boundary this also chooses the following run's
+    /// leading edge (`true`) or the preceding run's trailing edge (`false`).
+    /// Both positions refer to the same logical character boundary.
     pub prefer_next_row: bool,
 }
 

@@ -221,49 +221,57 @@ impl FontCell {
         &mut self,
         atlas: &mut TextureAtlas,
         metrics: &StyledMetrics,
-        glyph_id: GlyphId,
+        glyphs: &[ClusterGlyph],
         bin: SubpixelBin,
         location: skrifa::instance::LocationRef<'_>,
         hinting_target: skrifa::outline::Target,
     ) -> Option<GlyphAllocation> {
-        debug_assert!(
-            glyph_id != skrifa::GlyphId::NOTDEF,
-            "Can't allocate glyph for id 0"
-        );
-
         let mut path = kurbo::BezPath::new();
-        let mut pen = VelloPen {
-            path: &mut path,
-            x_offset: bin.as_float() as f64,
-        };
 
         self.with_dependent_mut(|_, font_data| {
-            let outline = font_data.outline_glyphs.get(glyph_id)?;
+            for glyph in glyphs {
+                let Some(outline) = font_data.outline_glyphs.get(glyph.glyph_id) else {
+                    continue;
+                };
+                let mut pen = VelloPen {
+                    path: &mut path,
+                    x_offset: (bin.as_float() + glyph.offset_px.x) as f64,
+                    y_offset: glyph.offset_px.y as f64,
+                };
 
-            if let Some(hinting_instance) = &mut font_data.hinting_instance {
-                let size = skrifa::instance::Size::new(metrics.scale);
-                if hinting_instance.size() != size
-                    || hinting_instance.location().coords() != location.coords()
-                    || hinting_instance.target() != hinting_target
-                {
-                    hinting_instance
-                        .reconfigure(&font_data.outline_glyphs, size, location, hinting_target)
-                        .ok()?;
+                if let Some(hinting_instance) = &mut font_data.hinting_instance {
+                    let size = skrifa::instance::Size::new(metrics.scale);
+                    if hinting_instance.size() != size
+                        || hinting_instance.location().coords() != location.coords()
+                        || hinting_instance.target() != hinting_target
+                    {
+                        hinting_instance
+                            .reconfigure(&font_data.outline_glyphs, size, location, hinting_target)
+                            .ok()?;
+                    }
+                    let draw_settings =
+                        skrifa::outline::DrawSettings::hinted(hinting_instance, false);
+                    outline.draw(draw_settings, &mut pen).ok()?;
+                } else {
+                    let draw_settings = skrifa::outline::DrawSettings::unhinted(
+                        skrifa::instance::Size::new(metrics.scale),
+                        location,
+                    );
+                    outline.draw(draw_settings, &mut pen).ok()?;
                 }
-                let draw_settings = skrifa::outline::DrawSettings::hinted(hinting_instance, false);
-                outline.draw(draw_settings, &mut pen).ok()?;
-            } else {
-                let draw_settings = skrifa::outline::DrawSettings::unhinted(
-                    skrifa::instance::Size::new(metrics.scale),
-                    location,
-                );
-                outline.draw(draw_settings, &mut pen).ok()?;
             }
-
             Some(())
         })?;
 
         let bounds = path.control_box().expand();
+        let max_side = atlas.options().max_texture_side.min(u16::MAX as usize) as f64;
+        if !bounds.width().is_finite()
+            || !bounds.height().is_finite()
+            || bounds.width() > max_side
+            || bounds.height() > max_side
+        {
+            return None;
+        }
         let width = bounds.width() as u16;
         let height = bounds.height() as u16;
 
@@ -317,29 +325,32 @@ impl FontCell {
 struct VelloPen<'a> {
     path: &'a mut kurbo::BezPath,
     x_offset: f64,
+    y_offset: f64,
 }
 
 impl skrifa::outline::OutlinePen for VelloPen<'_> {
     fn move_to(&mut self, x: f32, y: f32) {
-        self.path.move_to((x as f64 + self.x_offset, -y as f64));
+        self.path
+            .move_to((x as f64 + self.x_offset, self.y_offset - y as f64));
     }
 
     fn line_to(&mut self, x: f32, y: f32) {
-        self.path.line_to((x as f64 + self.x_offset, -y as f64));
+        self.path
+            .line_to((x as f64 + self.x_offset, self.y_offset - y as f64));
     }
 
     fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
         self.path.quad_to(
-            (cx0 as f64 + self.x_offset, -cy0 as f64),
-            (x as f64 + self.x_offset, -y as f64),
+            (cx0 as f64 + self.x_offset, self.y_offset - cy0 as f64),
+            (x as f64 + self.x_offset, self.y_offset - y as f64),
         );
     }
 
     fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
         self.path.curve_to(
-            (cx0 as f64 + self.x_offset, -cy0 as f64),
-            (cx1 as f64 + self.x_offset, -cy1 as f64),
-            (x as f64 + self.x_offset, -y as f64),
+            (cx0 as f64 + self.x_offset, self.y_offset - cy0 as f64),
+            (cx1 as f64 + self.x_offset, self.y_offset - cy1 as f64),
+            (x as f64 + self.x_offset, self.y_offset - y as f64),
         );
     }
 
@@ -635,7 +646,10 @@ impl FontFace {
                 .allocate_glyph_uncached(
                     atlas,
                     metrics,
-                    glyph_id,
+                    &[ClusterGlyph {
+                        glyph_id,
+                        offset_px: Vec2::ZERO,
+                    }],
                     bin,
                     (&metrics.location).into(),
                     hinting_target,
@@ -644,6 +658,70 @@ impl FontFace {
         });
 
         (alloc, h_pos_round)
+    }
+    /// Rasterize a shaped cluster together so marks retain their shaper offsets.
+    pub(crate) fn allocate_cluster(
+        &mut self,
+        atlas: &mut TextureAtlas,
+        metrics: &StyledMetrics,
+        glyphs: &[ClusterGlyph],
+        h_pos: f32,
+        is_cjk: bool,
+    ) -> (GlyphAllocation, i32) {
+        if let [glyph] = glyphs
+            && glyph.offset_px == Vec2::ZERO
+        {
+            return self.allocate_glyph(
+                atlas,
+                metrics,
+                &ShapedGlyph {
+                    glyph_id: glyph.glyph_id,
+                    h_pos,
+                    is_cjk,
+                },
+            );
+        }
+        let (physical_x, bin) = if self.subpixel_binning && !is_cjk {
+            SubpixelBin::new(h_pos)
+        } else {
+            (h_pos.round() as i32, SubpixelBin::Zero)
+        };
+        let key = GlyphCacheKey(crate::util::hash((
+            glyphs,
+            metrics.pixels_per_point.to_bits(),
+            metrics.px_scale_factor.to_bits(),
+            metrics.location_hash,
+            bin,
+        )));
+        let hinting_target = self.tweak.hinting_target.into();
+        let allocation = *self.glyph_alloc_cache.entry(key).or_insert_with(|| {
+            self.font
+                .allocate_glyph_uncached(
+                    atlas,
+                    metrics,
+                    glyphs,
+                    bin,
+                    (&metrics.location).into(),
+                    hinting_target,
+                )
+                .unwrap_or_default()
+        });
+        (allocation, physical_x)
+    }
+}
+
+/// An outline and its position relative to a shaped cluster origin.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClusterGlyph {
+    pub glyph_id: GlyphId,
+    pub offset_px: Vec2,
+}
+
+impl core::hash::Hash for ClusterGlyph {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.glyph_id.hash(state);
+        self.offset_px.x.to_bits().hash(state);
+        self.offset_px.y.to_bits().hash(state);
     }
 }
 

@@ -11,6 +11,19 @@ use emath::{Align, GuiRounding as _, NumExt as _, OrderedFloat, Pos2, Rect, Vec2
 pub use font_types::Tag;
 use smallvec::SmallVec;
 
+/// Paragraph base direction for Unicode bidirectional layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum TextDirection {
+    /// Infer each paragraph's direction from its first strong character.
+    #[default]
+    Auto,
+    /// Use a left-to-right paragraph base direction.
+    LeftToRight,
+    /// Use a right-to-left paragraph base direction.
+    RightToLeft,
+}
+
 /// Describes the task of laying out text.
 ///
 /// This supports mixing different fonts, color and formats (underline etc).
@@ -47,6 +60,8 @@ use smallvec::SmallVec;
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct LayoutJob {
+    /// Paragraph reading direction, independent of horizontal alignment.
+    pub direction: TextDirection,
     /// The complete text of this job, referenced by [`LayoutSection`].
     pub text: String,
 
@@ -100,6 +115,7 @@ impl Default for LayoutJob {
     #[inline]
     fn default() -> Self {
         Self {
+            direction: TextDirection::Auto,
             text: Default::default(),
             sections: Default::default(),
             wrap: Default::default(),
@@ -308,6 +324,7 @@ impl core::hash::Hash for LayoutJob {
     #[inline]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         let Self {
+            direction,
             text,
             sections,
             wrap,
@@ -319,6 +336,7 @@ impl core::hash::Hash for LayoutJob {
             keep_trailing_whitespace,
         } = self;
 
+        direction.hash(state);
         text.hash(state);
         sections.hash(state);
         wrap.hash(state);
@@ -808,7 +826,13 @@ impl PlacedRow {
 
     /// Same as [`Self::rect`] but excluding the `LayoutSection::leading_space`.
     pub fn rect_without_leading_space(&self) -> Rect {
-        let x = self.pos.x + self.glyphs.first().map_or(0.0, |g| g.pos.x);
+        let x = self.pos.x
+            + self
+                .glyphs
+                .iter()
+                .map(|g| g.pos.x)
+                .reduce(f32::min)
+                .unwrap_or(0.0);
         let right = self.pos.x + self.size.x;
         Rect::from_min_max(
             Pos2::new(x, self.pos.y),
@@ -828,6 +852,8 @@ impl core::ops::Deref for PlacedRow {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Row {
+    /// Unicode paragraph base level, also used when navigating across wrapped rows.
+    pub paragraph_level: u8,
     /// This is included in case there are no glyphs.
     ///
     /// Only used during layout, then set to an invalid value in order to
@@ -884,6 +910,10 @@ impl Default for RowVisuals {
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Glyph {
+    /// Resolved Unicode bidi embedding level. Glyph arrays remain in logical order.
+    pub bidi_level: u8,
+    /// True for additional characters in a single shaped cluster.
+    pub cluster_continuation: bool,
     /// The character this glyph represents.
     pub chr: char,
 
@@ -927,6 +957,10 @@ pub struct Glyph {
 }
 
 impl Glyph {
+    /// Whether this glyph reads right to left.
+    pub fn is_rtl(&self) -> bool {
+        self.bidi_level % 2 == 1
+    }
     #[inline]
     pub fn size(&self) -> Vec2 {
         Vec2::new(self.advance_width, self.line_height)
@@ -961,20 +995,134 @@ impl Row {
     /// Closest char at the desired x coordinate in row-relative coordinates.
     /// Returns something in the range `[0, char_count_excluding_newline()]`.
     pub fn char_at(&self, desired_x: f32) -> CharIndex {
-        for (i, glyph) in self.glyphs.iter().enumerate() {
-            if desired_x < glyph.logical_rect().center().x {
-                return CharIndex(i);
+        self.cursor_at(desired_x).index
+    }
+
+    fn cursor_at(&self, desired_x: f32) -> CCursor {
+        let cursors = self.visual_cursors();
+        let min_x = cursors.first().map_or(0.0, |c| self.cursor_x(*c));
+        let max_x = cursors.last().map_or(min_x, |c| self.cursor_x(*c));
+        let desired_x = desired_x.max(min_x).min(max_x);
+        cursors
+            .into_iter()
+            .min_by(|a, b| {
+                (self.cursor_x(*a) - desired_x)
+                    .abs()
+                    .total_cmp(&(self.cursor_x(*b) - desired_x).abs())
+            })
+            .unwrap_or_default()
+    }
+
+    fn has_bidi_boundary(&self, column: usize) -> bool {
+        column
+            .checked_sub(1)
+            .and_then(|i| self.glyphs.get(i))
+            .zip(self.glyphs.get(column))
+            .is_some_and(|(before, after)| before.is_rtl() != after.is_rtl())
+    }
+
+    fn cursor_x(&self, cursor: CCursor) -> f32 {
+        if !cursor.prefer_next_row
+            && self.has_bidi_boundary(cursor.index.0)
+            && let Some(previous) = cursor
+                .index
+                .0
+                .checked_sub(1)
+                .and_then(|i| self.glyphs.get(i))
+        {
+            if previous.is_rtl() {
+                previous.pos.x
+            } else {
+                previous.max_x()
+            }
+        } else {
+            self.x_offset(cursor.index)
+        }
+    }
+
+    fn visual_cursors(&self) -> Vec<CCursor> {
+        use unicode_segmentation::UnicodeSegmentation as _;
+        let text = self.text();
+        let boundaries =
+            core::iter::once(0).chain(text.graphemes(true).scan(0usize, |index, grapheme| {
+                *index = index.saturating_add(grapheme.chars().count());
+                Some(*index)
+            }));
+        let mut cursors = Vec::new();
+        for index in boundaries {
+            cursors.push(CCursor {
+                index: CharIndex(index),
+                prefer_next_row: index < self.glyphs.len(),
+            });
+            if self.has_bidi_boundary(index) {
+                cursors.push(CCursor {
+                    index: CharIndex(index),
+                    prefer_next_row: false,
+                });
             }
         }
-        self.char_count_excluding_newline()
+        cursors.sort_by(|a, b| {
+            self.cursor_x(*a)
+                .total_cmp(&self.cursor_x(*b))
+                .then_with(|| a.index.cmp(&b.index))
+        });
+        cursors
     }
 
     pub fn x_offset(&self, column: CharIndex) -> f32 {
         if let Some(glyph) = self.glyphs.get(column.0) {
-            glyph.pos.x
+            if glyph.is_rtl() {
+                glyph.max_x()
+            } else {
+                glyph.pos.x
+            }
+        } else if let Some(glyph) = self.glyphs.last() {
+            if glyph.is_rtl() {
+                glyph.pos.x
+            } else {
+                glyph.max_x()
+            }
         } else {
-            self.size.x
+            0.0
         }
+    }
+
+    /// Visual intervals covered by a logical character range.
+    /// A selection can have several disjoint intervals in bidirectional text.
+    pub fn selection_x_ranges(
+        &self,
+        columns: core::ops::Range<usize>,
+    ) -> Vec<core::ops::Range<f32>> {
+        let mut visual: Vec<_> = self
+            .glyphs
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.advance_width > 0.0)
+            .collect();
+        visual.sort_by(|(_, a), (_, b)| a.pos.x.total_cmp(&b.pos.x));
+        let mut ranges: Vec<_> = visual
+            .iter()
+            .enumerate()
+            .filter(|(_, (index, _))| columns.contains(index))
+            .map(|(i, (_, glyph))| {
+                glyph.pos.x
+                    ..visual
+                        .get(i + 1)
+                        .map_or_else(|| glyph.max_x(), |(_, next)| next.pos.x)
+            })
+            .collect();
+        ranges.sort_by(|a, b| a.start.total_cmp(&b.start));
+        let mut merged: Vec<core::ops::Range<f32>> = Vec::new();
+        for range in ranges {
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end + 0.01
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        merged
     }
 
     #[inline]
@@ -1168,7 +1316,16 @@ impl Galley {
 
     /// Returns a 0-width Rect.
     pub fn pos_from_cursor(&self, cursor: CCursor) -> Rect {
-        self.pos_from_layout_cursor(&self.layout_from_cursor(cursor))
+        let layout = self.layout_from_cursor(cursor);
+        let Some(row) = self.rows.get(layout.row) else {
+            return self.end_pos();
+        };
+        let x = row.pos.x
+            + row.cursor_x(CCursor {
+                index: layout.column,
+                ..cursor
+            });
+        Rect::from_min_max(pos2(x, row.min_y()), pos2(x, row.max_y()))
     }
 
     /// Cursor at the given position within the galley.
@@ -1207,11 +1364,10 @@ impl Galley {
             if is_pos_within_row || y_dist < best_y_dist {
                 best_y_dist = y_dist;
                 // char_at is `Row` not `PlacedRow` relative which means we have to subtract the pos.
-                let column = row.char_at(pos.x - row.pos.x);
-                let prefer_next_row = column < row.char_count_excluding_newline();
+                let local = row.cursor_at(pos.x - row.pos.x);
                 cursor = CCursor {
-                    index: ccursor_index + column,
-                    prefer_next_row,
+                    index: ccursor_index + local.index,
+                    ..local
                 };
 
                 if is_pos_within_row {
@@ -1320,27 +1476,88 @@ impl Galley {
 
 /// ## Cursor positions
 impl Galley {
-    #[expect(clippy::unused_self)]
     pub fn cursor_left_one_character(&self, cursor: &CCursor) -> CCursor {
-        if cursor.index == CharIndex::ZERO {
-            Default::default()
-        } else {
-            CCursor {
-                index: cursor.index - 1,
-                prefer_next_row: true, // default to this when navigating. It is more often useful to put cursor at the beginning of a row than at the end.
-            }
-        }
+        self.move_cursor_visually(cursor, false)
     }
 
     pub fn cursor_right_one_character(&self, cursor: &CCursor) -> CCursor {
-        CCursor {
-            index: (cursor.index + 1).min(self.end().index),
-            prefer_next_row: true, // default to this when navigating. It is more often useful to put cursor at the beginning of a row than at the end.
+        self.move_cursor_visually(cursor, true)
+    }
+
+    fn move_cursor_visually(&self, cursor: &CCursor, right: bool) -> CCursor {
+        let current = self.layout_from_cursor(*cursor);
+        let Some(row) = self.rows.get(current.row) else {
+            return self.clamp_cursor(cursor);
+        };
+        let cursors = row.visual_cursors();
+        let Some(position) = cursors.iter().position(|c| {
+            c.index == current.column
+                && (!row.has_bidi_boundary(c.index.0)
+                    || c.prefer_next_row == cursor.prefer_next_row)
+        }) else {
+            // External selection actions can place a caret inside a grapheme.
+            let rtl = row.glyphs.get(current.column.0).is_some_and(Glyph::is_rtl);
+            let forward = right != rtl;
+            let boundary = if forward {
+                cursors
+                    .iter()
+                    .filter(|c| c.index > current.column)
+                    .min_by_key(|c| c.index)
+            } else {
+                cursors
+                    .iter()
+                    .filter(|c| c.index < current.column)
+                    .max_by_key(|c| c.index)
+            };
+            return boundary.map_or(*cursor, |local| {
+                let mut moved = self.cursor_from_layout(LayoutCursor {
+                    row: current.row,
+                    column: local.index,
+                });
+                moved.prefer_next_row = local.prefer_next_row;
+                moved
+            });
+        };
+        let next = if right {
+            position.checked_add(1)
+        } else {
+            position.checked_sub(1)
+        };
+        if let Some(local) = next.and_then(|i| cursors.get(i)) {
+            let mut moved = self.cursor_from_layout(LayoutCursor {
+                row: current.row,
+                column: local.index,
+            });
+            moved.prefer_next_row = local.prefer_next_row;
+            return moved;
         }
+        let forward = right != (row.paragraph_level % 2 == 1);
+        let next_row = if forward {
+            current.row.checked_add(1)
+        } else {
+            current.row.checked_sub(1)
+        };
+        if let Some((index, row)) = next_row.and_then(|i| self.rows.get(i).map(|row| (i, row))) {
+            let local = row.cursor_at(if forward != (row.paragraph_level % 2 == 1) {
+                -f32::MAX
+            } else {
+                f32::MAX
+            });
+            let mut moved = self.cursor_from_layout(LayoutCursor {
+                row: index,
+                column: local.index,
+            });
+            moved.prefer_next_row = local.prefer_next_row;
+            return moved;
+        }
+        *cursor
     }
 
     pub fn clamp_cursor(&self, cursor: &CCursor) -> CCursor {
-        self.cursor_from_layout(self.layout_from_cursor(*cursor))
+        CCursor {
+            prefer_next_row: cursor.prefer_next_row,
+            ..self.cursor_from_layout(self.layout_from_cursor(*cursor))
+        }
     }
 
     pub fn cursor_up_one_row(
@@ -1349,7 +1566,7 @@ impl Galley {
         h_pos: Option<f32>,
     ) -> (CCursor, Option<f32>) {
         let layout_cursor = self.layout_from_cursor(*cursor);
-        let h_pos = h_pos.unwrap_or_else(|| self.pos_from_layout_cursor(&layout_cursor).center().x);
+        let h_pos = h_pos.unwrap_or_else(|| self.pos_from_cursor(*cursor).center().x);
         if layout_cursor.row == 0 {
             (CCursor::default(), None)
         } else {
@@ -1364,7 +1581,11 @@ impl Galley {
                     column,
                 }
             };
-            (self.cursor_from_layout(new_layout_cursor), Some(h_pos))
+            let y = self
+                .rows
+                .get(new_layout_cursor.row)
+                .map_or(0.0, |row| row.rect().center().y);
+            (self.cursor_from_pos(vec2(h_pos, y)), Some(h_pos))
         }
     }
 
@@ -1374,7 +1595,7 @@ impl Galley {
         h_pos: Option<f32>,
     ) -> (CCursor, Option<f32>) {
         let layout_cursor = self.layout_from_cursor(*cursor);
-        let h_pos = h_pos.unwrap_or_else(|| self.pos_from_layout_cursor(&layout_cursor).center().x);
+        let h_pos = h_pos.unwrap_or_else(|| self.pos_from_cursor(*cursor).center().x);
         if layout_cursor.row + 1 < self.rows.len() {
             let new_row = layout_cursor.row + 1;
 
@@ -1388,7 +1609,11 @@ impl Galley {
                 }
             };
 
-            (self.cursor_from_layout(new_layout_cursor), Some(h_pos))
+            let y = self
+                .rows
+                .get(new_layout_cursor.row)
+                .map_or(0.0, |row| row.rect().center().y);
+            (self.cursor_from_pos(vec2(h_pos, y)), Some(h_pos))
         } else {
             (self.end(), None)
         }

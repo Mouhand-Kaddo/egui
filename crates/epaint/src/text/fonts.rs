@@ -1197,6 +1197,7 @@ impl GalleyCache {
             }
 
             let mut paragraph_job = LayoutJob {
+                direction: job.direction,
                 text: job.text[start..end].to_owned(),
                 wrap: crate::text::TextWrapping {
                     max_rows: max_rows_remaining,

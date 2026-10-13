@@ -47,23 +47,22 @@ pub fn paint_text_selection(
         let placed_row = &mut galley.rows[ri];
         let row = Arc::make_mut(&mut placed_row.row);
 
-        let left = if ri == min.row {
-            row.x_offset(min.column)
+        let first_column = if ri == min.row { min.column.0 } else { 0 };
+        let last_column = if ri == max.row {
+            max.column.0
         } else {
-            0.0
+            row.glyphs.len()
         };
-        let right = if ri == max.row {
-            row.x_offset(max.column)
-        } else {
-            let newline_size = if placed_row.ends_with_newline {
-                row.height() / 2.0 // visualize that we select the newline
+        let mut ranges = row.selection_x_ranges(first_column..last_column);
+        if ri < max.row && placed_row.ends_with_newline {
+            let x = row.x_offset(row.char_count_excluding_newline());
+            let width = row.height() / 2.0;
+            ranges.push(if row.paragraph_level % 2 == 1 {
+                x - width..x
             } else {
-                0.0
-            };
-            row.size.x + newline_size
-        };
-
-        let rect = Rect::from_min_max(pos2(left, 0.0), pos2(right, row.size.y));
+                x..x + width
+            });
+        }
         let mesh = &mut row.visuals.mesh;
 
         if !row.glyphs.is_empty() {
@@ -89,46 +88,27 @@ pub fn paint_text_selection(
             }
         }
 
-        // Time to insert the selection rectangle into the row mesh.
-        // It should be on top (after) of any background in the galley,
-        // but behind (before) any glyphs. The row visuals has this information:
-        let glyph_index_start = row.visuals.glyph_index_start;
-
-        // Start by appending the selection rectangle to end of the mesh, as two triangles (= 6 indices):
-        let num_indices_before = mesh.indices.len();
-        mesh.add_colored_rect(rect, background_color);
-        assert_eq!(
-            num_indices_before + 6,
-            mesh.indices.len(),
-            "We expect exactly 6 new indices"
-        );
-
-        // Copy out the new triangles:
-        let selection_triangles = [
-            mesh.indices[num_indices_before],
-            mesh.indices[num_indices_before + 1],
-            mesh.indices[num_indices_before + 2],
-            mesh.indices[num_indices_before + 3],
-            mesh.indices[num_indices_before + 4],
-            mesh.indices[num_indices_before + 5],
-        ];
-
-        // Move every old triangle forwards by 6 indices to make room for the new triangle:
-        for i in (glyph_index_start..num_indices_before).rev() {
-            mesh.indices.swap(i, i + 6);
+        for range in ranges {
+            let rect = Rect::from_min_max(pos2(range.start, 0.0), pos2(range.end, row.size.y));
+            let glyph_index_start = row.visuals.glyph_index_start;
+            let num_indices_before = mesh.indices.len();
+            mesh.add_colored_rect(rect, background_color);
+            let mut selection_triangles = [0; 6];
+            if let Some(indices) = mesh.indices.get(num_indices_before..) {
+                selection_triangles.copy_from_slice(indices);
+            }
+            // Rotate the appended background triangles in front of the glyphs.
+            if let Some(indices) = mesh.indices.get_mut(glyph_index_start..) {
+                indices.rotate_right(6);
+            }
+            if let Some(new_vertex_indices) = &mut new_vertex_indices {
+                new_vertex_indices.push(RowVertexIndices {
+                    row: ri,
+                    vertex_indices: selection_triangles,
+                });
+            }
         }
-        // Put the new triangle in place:
-        mesh.indices[glyph_index_start..glyph_index_start + 6]
-            .clone_from_slice(&selection_triangles);
-
         row.visuals.mesh_bounds = mesh.calc_bounds();
-
-        if let Some(new_vertex_indices) = &mut new_vertex_indices {
-            new_vertex_indices.push(RowVertexIndices {
-                row: ri,
-                vertex_indices: selection_triangles,
-            });
-        }
     }
 }
 
@@ -241,23 +221,22 @@ fn paint_underlines(
         let placed_row = &galley.rows[ri];
         let row = &placed_row.row;
 
-        let left = if ri == min.row {
-            row.x_offset(min.column)
+        let start = if ri == min.row { min.column.0 } else { 0 };
+        let end = if ri == max.row {
+            max.column.0
         } else {
-            0.0
+            row.glyphs.len()
         };
-        let right = if ri == max.row {
-            row.x_offset(max.column)
-        } else {
-            row.size.x
-        };
-
         let offset_y = placed_row.pos.y + row.size.y;
-
-        painter.line_segment(
-            [pos + vec2(left, offset_y), pos + vec2(right, offset_y)],
-            stroke,
-        );
+        for range in row.selection_x_ranges(start..end) {
+            painter.line_segment(
+                [
+                    pos + vec2(range.start, offset_y),
+                    pos + vec2(range.end, offset_y),
+                ],
+                stroke,
+            );
+        }
     }
 }
 

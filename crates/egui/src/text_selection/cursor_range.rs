@@ -119,11 +119,17 @@ impl CCursorRange {
             }
 
             Key::ArrowLeft | Key::ArrowRight if modifiers.is_none() && !self.is_empty() => {
-                if key == Key::ArrowLeft {
-                    *self = Self::one(self.sorted_cursors()[0]);
+                let mut ends = [self.primary, self.secondary];
+                ends.sort_by(|a, b| {
+                    let a = galley.pos_from_cursor(*a).center();
+                    let b = galley.pos_from_cursor(*b).center();
+                    a.y.total_cmp(&b.y).then_with(|| a.x.total_cmp(&b.x))
+                });
+                *self = Self::one(if key == Key::ArrowLeft {
+                    ends[0]
                 } else {
-                    *self = Self::one(self.sorted_cursors()[1]);
-                }
+                    ends[1]
+                });
                 true
             }
 
@@ -221,31 +227,24 @@ fn ccursor_from_accesskit_text_position(
     galley: &Galley,
     position: &accesskit::TextPosition,
 ) -> Option<CCursor> {
-    use super::accesskit_text::MAX_CHARS_PER_TEXT_RUN;
-
     let mut total_length = 0usize;
     for (i, row) in galley.rows.iter().enumerate() {
-        let row_chars = row.glyphs.len() + (row.ends_with_newline as usize);
-        let num_chunks = if row_chars == 0 {
-            1
-        } else {
-            row_chars.div_ceil(MAX_CHARS_PER_TEXT_RUN)
-        };
-
-        for chunk_idx in 0..num_chunks {
-            let run_id = id.with(i).with(chunk_idx);
-            if run_id.accesskit_id() == position.node {
-                let column = chunk_idx * MAX_CHARS_PER_TEXT_RUN + position.character_index;
+        for (chunk, range) in super::accesskit_text::text_run_ranges(row)
+            .into_iter()
+            .enumerate()
+        {
+            if id.with(i).with(chunk).accesskit_id() == position.node {
+                if position.character_index > range.len() {
+                    return None;
+                }
+                let column = range.start.checked_add(position.character_index)?;
                 return Some(CCursor {
-                    index: CharIndex(total_length + column),
-                    prefer_next_row: !(column == row.glyphs.len()
-                        && !row.ends_with_newline
-                        && (i + 1) < galley.rows.len()),
+                    index: CharIndex(total_length.checked_add(column)?),
+                    prefer_next_row: position.character_index < range.len(),
                 });
             }
         }
-
-        total_length += row_chars;
+        total_length = total_length.checked_add(row.char_count_including_newline().0)?;
     }
     None
 }
@@ -277,7 +276,7 @@ fn move_single_cursor(
                 Key::ArrowLeft => {
                     if modifiers.alt || modifiers.ctrl {
                         // alt on mac, ctrl on windows
-                        (ccursor_previous_word(galley, *cursor), None)
+                        (cursor_visual_word(galley, *cursor, false), None)
                     } else if modifiers.mac_cmd {
                         (galley.cursor_begin_of_row(cursor), None)
                     } else {
@@ -287,7 +286,7 @@ fn move_single_cursor(
                 Key::ArrowRight => {
                     if modifiers.alt || modifiers.ctrl {
                         // alt on mac, ctrl on windows
-                        (ccursor_next_word(galley, *cursor), None)
+                        (cursor_visual_word(galley, *cursor, true), None)
                     } else if modifiers.mac_cmd {
                         (galley.cursor_end_of_row(cursor), None)
                     } else {
@@ -334,4 +333,87 @@ fn move_single_cursor(
 
     *cursor = new_cursor;
     *h_pos = new_h_pos;
+}
+
+/// Move to the far edge of the next word in visual order.
+fn cursor_visual_word(galley: &Galley, cursor: CCursor, right: bool) -> CCursor {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    if !galley
+        .rows
+        .iter()
+        .any(|row| row.glyphs.iter().any(|g| g.is_rtl()))
+    {
+        return if right {
+            ccursor_next_word(galley, cursor)
+        } else {
+            ccursor_previous_word(galley, cursor)
+        };
+    }
+    let mut row_index = galley.layout_from_cursor(cursor).row;
+    let mut x = galley.pos_from_cursor(cursor).center().x;
+    for _ in 0..galley.rows.len() {
+        let Some(row) = galley.rows.get(row_index) else {
+            break;
+        };
+        if x == -f32::MAX {
+            x = row.pos.x + row.glyphs.iter().map(|g| g.pos.x).fold(0.0, f32::min) - 1.0;
+        }
+        if x == f32::MAX {
+            x = row.pos.x + row.glyphs.iter().map(|g| g.max_x()).fold(0.0, f32::max) + 1.0;
+        }
+        let row_start: usize = galley
+            .rows
+            .iter()
+            .take(row_index)
+            .map(|r| r.char_count_including_newline().0)
+            .sum();
+        let mut char_start = 0usize;
+        let mut nearest: Option<(f32, CCursor)> = None;
+        for word in row.text().split_word_bounds() {
+            let char_end = char_start.saturating_add(word.chars().count());
+            if !word.chars().all(char::is_whitespace) {
+                let spans = row.selection_x_ranges(char_start..char_end);
+                let edge = if right {
+                    spans.last().map(|r| r.end)
+                } else {
+                    spans.first().map(|r| r.start)
+                };
+                if let Some(edge) = edge {
+                    let edge = edge + row.pos.x;
+                    let distance = if right { edge - x } else { x - edge };
+                    if distance > 0.5 && nearest.as_ref().is_none_or(|(best, _)| distance < *best) {
+                        let rtl = row.glyphs.get(char_start).is_some_and(|g| g.is_rtl());
+                        let at_start = right == rtl;
+                        nearest = Some((
+                            distance,
+                            CCursor {
+                                index: CharIndex(row_start.saturating_add(if at_start {
+                                    char_start
+                                } else {
+                                    char_end
+                                })),
+                                prefer_next_row: at_start,
+                            },
+                        ));
+                    }
+                }
+            }
+            char_start = char_end;
+        }
+        if let Some((_, next)) = nearest {
+            return next;
+        }
+        let forward = right != (row.paragraph_level % 2 == 1);
+        let next = if forward {
+            row_index.checked_add(1)
+        } else {
+            row_index.checked_sub(1)
+        };
+        let Some(next) = next else {
+            break;
+        };
+        row_index = next;
+        x = if right { -f32::MAX } else { f32::MAX };
+    }
+    cursor
 }
